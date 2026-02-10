@@ -1,19 +1,26 @@
 # src/config.py
+MODEL_ARCH = "efficientnet_v2_s"
 
 
 CLASS_NAMES = [
-    "acne", "oily", "dark_spots", "wrinkles", "sensitive", "eye_bags", "dullness"
+    "Dark Circle",
+    "PIH",
+    "blackhead",
+    "papule",
+    "pustule",
+    "whitehead",
+    "wrinkle",
 ]
 
 
 LABEL_TO_CONCERN_ID = {
-    "dullness": 1,      # Whitening
-    "dark_spots": 1,    # Whitening
-    "wrinkles": 2,      # Anti-Aging
-    "acne": 3,          # Acne & Oily
-    "oily": 3,          # Acne & Oily
-    "eye_bags": 4,      # Eye Care
-    "sensitive": 5      # Sensitive Skin
+    "Dark Circle": 1,   # Whitening
+    "PIH": 1,           # Whitening
+    "blackhead": 2,     # Anti-Aging
+    "papule": 3,        # Acne & Oily
+    "pustule": 3,       # Acne & Oily
+    "whitehead": 4,     # Eye Care
+    "wrinkle": 5        # Sensitive Skin
 }
 
 
