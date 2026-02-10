@@ -10,6 +10,7 @@ st.set_page_config(page_title="Skin Analyzer + Recommender", layout="wide")
 
 @st.cache_resource
 def load_classifier():
+    # classifier will read labels from models/labels.json automatically
     return SkinConcernClassifier("models/best_model.pth", device="cpu")
 
 @st.cache_resource
@@ -25,6 +26,10 @@ st.title("Skin Concern Classification + Product Recommendation (Demo)")
 clf = load_classifier()
 rec = load_recommender()
 item_meta = load_item_meta()
+
+# Show model labels (from labels.json)
+with st.expander("Model target classes (from models/labels.json)", expanded=False):
+    st.write(clf.class_names)
 
 # ---------- Sidebar: user info ----------
 st.sidebar.header("User Info")
@@ -55,7 +60,7 @@ with col1:
         img = Image.open(up)
 
     if img:
-        st.image(img, caption="Input image", use_container_width=True)
+        st.image(img, caption="Input image", width='stretch')
 
 analyze_btn = st.button("Analyze → Recommend", type="primary", disabled=(img is None))
 
@@ -71,16 +76,22 @@ with col2:
             pd.DataFrame(pred.label_scores.items(), columns=["label", "score"])
             .sort_values("score", ascending=False)
         )
-        st.dataframe(score_df, use_container_width=True)
+        st.dataframe(score_df, width='stretch')
 
-        # predicted concern IDs
-        predicted_concerns = pred.concern_ids
+        # predicted concern IDs (may be empty until you update LABEL_TO_CONCERN_ID)
+        predicted_concerns = pred.concern_ids or []
+
         if not predicted_concerns:
-            st.warning("No concerns mapped from model output. Check LABEL_TO_CONCERN_ID in config.py.")
-            st.stop()
+            st.warning(
+                "No concerns mapped from model output yet (LABEL_TO_CONCERN_ID in src/config.py doesn't match your new labels). "
+                "You can still manually pick concern IDs below."
+            )
 
         st.markdown("### Selected skin concerns (from image)")
-        st.write([f"{cid} - {CONCERN_ID_TO_NAME.get(cid, str(cid))}" for cid in predicted_concerns])
+        if predicted_concerns:
+            st.write([f"{cid} - {CONCERN_ID_TO_NAME.get(cid, str(cid))}" for cid in predicted_concerns])
+        else:
+            st.write("[]")
 
         # allow user to override / add concerns
         st.markdown("### (Optional) Adjust concerns")
@@ -91,6 +102,10 @@ with col2:
             default=predicted_concerns
         )
         chosen = sorted(list(set(chosen)))
+
+        if not chosen:
+            st.info("Pick at least 1 concern ID to generate recommendations.")
+            st.stop()
 
         # Recommend
         recs = rec.recommend(
@@ -105,20 +120,18 @@ with col2:
         st.markdown("### 3) Recommendations")
 
         if not recs:
-            st.info("No recommendations found. (Cold-start or strict filters) Try adding concerns or disabling demographic filter in code.")
+            st.info("No recommendations found. Try adding concerns or relaxing filters.")
             st.stop()
 
         # Join with item meta for display
         rec_df = pd.DataFrame([{"item_number": r.item_number, "score": r.score, "reason": r.reason} for r in recs])
         show = rec_df.merge(item_meta, on="item_number", how="left")
 
-        # Display as simple table
         st.dataframe(
-            show[["item_number", "skin_concern_cat_name", "score", "reason"] + [c for c in show.columns if c not in ["item_number","skin_concern_cat_name","score","reason"]][:0]],
-            use_container_width=True
+            show[["item_number", "skin_concern_cat_name", "score", "reason"]],
+            width='stretch'
         )
 
-        # Quick export
         st.download_button(
             "Download results (CSV)",
             data=show.to_csv(index=False).encode("utf-8"),

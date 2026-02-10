@@ -1,0 +1,32 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- Virtual envs ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Streamlit ----
+.streamlit/secrets.toml
+.streamlit/*.toml
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Logs / temp ----
+*.log
+*.tmp
+
+# ---- Model artifacts ----
+models/*.pth
+models/*.pt
+models/*.ckpt
