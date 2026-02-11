@@ -1,5 +1,6 @@
 # ---- Python ----
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 
@@ -16,8 +17,11 @@ Thumbs.db
 .idea/
 
 # ---- Streamlit ----
+.streamlit/
+!.streamlit/config.toml
+!.streamlit/credentials.toml
+# (keep secrets always ignored)
 .streamlit/secrets.toml
-.streamlit/*.toml
 
 # ---- Jupyter ----
 .ipynb_checkpoints/
@@ -30,3 +34,11 @@ Thumbs.db
 models/*.pth
 models/*.pt
 models/*.ckpt
+
+# ---- Build / cache ----
+.pytest_cache/
+.mypy_cache/
+ruff_cache/
+dist/
+build/
+*.egg-info/
