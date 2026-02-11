@@ -1,6 +1,6 @@
 # src/recommender.py
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 from collections import defaultdict
 import pickle
 import numpy as np
@@ -205,23 +205,66 @@ class Recommender:
         ]
 
     def _fallback_popular(self, concern_ids: List[int], top_k: int) -> List[RecItem]:
-        """Fallback: interleave popular items across concerns."""
-        pools = [self.popular_by_concern.get(cid, []) for cid in concern_ids]
+        """
+        Fallback: interleave popular items across concerns with normalized scores.
+        Supports both new format [(item, qty), ...] and old format [item, ...].
+        """
+        # Build pools with scores for each concern
+        pools_with_scores = []
+        
+        for cid in concern_ids:
+            items_data = self.popular_by_concern.get(cid, [])
+            if not items_data:
+                pools_with_scores.append([])
+                continue
+            
+            # Check format: tuple (item, qty) or plain item number
+            first_item = items_data[0]
+            if isinstance(first_item, (tuple, list)) and len(first_item) == 2:
+                # NEW FORMAT: [(item_number, qty), ...]
+                items = [int(item) for item, qty in items_data]
+                quantities = [float(qty) for item, qty in items_data]
+                
+                # Normalize scores: score = qty / max_qty in this concern
+                max_qty = max(quantities) if quantities else 1.0
+                scores = [qty / max_qty for qty in quantities]
+                
+                pool = [
+                    (items[i], scores[i], f"Popular in concern {cid} (qty={quantities[i]:.0f})")
+                    for i in range(len(items))
+                ]
+            else:
+                # OLD FORMAT (backward compatibility): [item_number, ...]
+                items = [int(item) for item in items_data]
+                # Use rank-based score: 1.0 for rank 1, decreasing linearly
+                scores = [1.0 - (i / len(items)) for i in range(len(items))]
+                pool = [
+                    (items[i], scores[i], f"Popular in concern {cid} (rank {i+1})")
+                    for i in range(len(items))
+                ]
+            
+            pools_with_scores.append(pool)
+        
+        # Interleave across concerns
         out = []
         seen = set()
-        ptrs = [0] * len(pools)
-
-        while len(out) < top_k and any(ptrs[i] < len(pools[i]) for i in range(len(pools))):
-            for i in range(len(pools)):
-                if ptrs[i] >= len(pools[i]):
+        ptrs = [0] * len(pools_with_scores)
+        
+        while len(out) < top_k and any(ptrs[i] < len(pools_with_scores[i]) for i in range(len(pools_with_scores))):
+            for i in range(len(pools_with_scores)):
+                if ptrs[i] >= len(pools_with_scores[i]):
                     continue
-                item = pools[i][ptrs[i]]
+                
+                item, score, reason = pools_with_scores[i][ptrs[i]]
                 ptrs[i] += 1
+                
                 if item in seen:
                     continue
                 seen.add(item)
-                out.append(RecItem(item_number=int(item), score=0.0, reason=f"Popular in concern {concern_ids[i]}"))
+                
+                out.append(RecItem(item_number=item, score=score, reason=reason))
+                
                 if len(out) >= top_k:
                     break
-
+        
         return out

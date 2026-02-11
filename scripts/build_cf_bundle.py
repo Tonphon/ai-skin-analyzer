@@ -118,7 +118,7 @@ def main():
         .to_dict()
     )
 
-    # ---- Popular-by-concern fallback ----
+    # ---- Popular-by-concern fallback (NEW: store tuples with quantities) ----
     pop = (
         train.groupby(["skin_concern_cat_id", "item_number"])["sales_quantity"]
         .sum()
@@ -128,8 +128,12 @@ def main():
 
     popular_by_concern = {}
     for cid in VALID_CONCERNS:
-        top_items = pop.loc[pop["skin_concern_cat_id"] == cid, "item_number"].head(TOP_POP_PER_CONCERN)
-        popular_by_concern[cid] = list(map(int, top_items.tolist()))
+        concern_items = pop[pop["skin_concern_cat_id"] == cid].head(TOP_POP_PER_CONCERN)
+        # Store as list of (item_number, sales_quantity) tuples
+        popular_by_concern[cid] = [
+            (int(row["item_number"]), float(row["sales_quantity"]))
+            for _, row in concern_items.iterrows()
+        ]
 
     # ---- Item meta ----
     item_meta = item_master.copy()
@@ -149,6 +153,13 @@ def main():
     print("✅ Saved:", OUT_PATH)
     print("Users:", user_item_matrix.shape[0], "Items:", user_item_matrix.shape[1])
     print("Train rows:", len(train))
+    
+    # Print sample popular items for verification
+    print("\nSample popular items by concern:")
+    for cid in VALID_CONCERNS[:2]:  # Show first 2 concerns
+        if cid in popular_by_concern:
+            print(f"  Concern {cid}: {len(popular_by_concern[cid])} items, "
+                  f"top item qty = {popular_by_concern[cid][0][1] if popular_by_concern[cid] else 0:.1f}")
 
 
 if __name__ == "__main__":
