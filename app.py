@@ -10,7 +10,6 @@ st.set_page_config(page_title="Skin Analyzer + Recommender", layout="wide")
 
 @st.cache_resource
 def load_classifier():
-    # classifier will read labels from models/labels.json automatically
     return SkinConcernClassifier("models/best_model.pth", device="cpu")
 
 @st.cache_resource
@@ -33,17 +32,65 @@ with st.expander("Model target classes (from models/labels.json)", expanded=Fals
 
 # ---------- Sidebar: user info ----------
 st.sidebar.header("User Info")
-mode = st.sidebar.radio("User type", ["Existing user (has userID)", "New user (no history)"])
+
+# Initialize session state for mode if not exists
+if "user_mode" not in st.session_state:
+    st.session_state.user_mode = "New user (no history)"
+
+# Mode selection
+mode = st.sidebar.radio(
+    "User type",
+    ["Existing user (has userID)", "New user (no history)"],
+    key="user_mode"
+)
 
 user_id = None
-gender = st.sidebar.selectbox("Gender", ["F", "M"], index=0)
-birth_year = st.sidebar.number_input("Birth year", min_value=1940, max_value=2026, value=2003, step=1)
+gender = None
+birth_year = None
 
+if mode == "Existing user (has userID)":
+    # Get list of available users
+    available_users = rec.get_all_users()
+    
+    if available_users:
+        user_id = st.sidebar.selectbox("Select User ID", options=available_users)
+        
+        # Fetch user demographics from stored data
+        user_demo = rec.get_user_demographics(user_id)
+        
+        if user_demo is not None:
+            st.sidebar.info(f"**Gender:** {user_demo['gender']}")
+            st.sidebar.info(f"**Age Group:** {user_demo['age_group']}")
+            gender = user_demo['gender']
+            # Derive approximate birth_year from age_group (use midpoint for calculations)
+            age_group = user_demo['age_group']
+            if age_group == "18-24":
+                birth_year = 2025 - 21
+            elif age_group == "25-34":
+                birth_year = 2025 - 30
+            elif age_group == "35-44":
+                birth_year = 2025 - 40
+            elif age_group == "45-54":
+                birth_year = 2025 - 50
+            else:  # 55+
+                birth_year = 2025 - 60
+        else:
+            st.sidebar.warning("User demographics not found. Using defaults.")
+            gender = "F"
+            birth_year = 2003
+    else:
+        st.sidebar.warning("No existing users found in the system.")
+        user_id = None
+
+else:  # New user
+    st.sidebar.subheader("Enter your details")
+    gender = st.sidebar.selectbox("Gender", ["F", "M"], index=0)
+    birth_year = st.sidebar.number_input("Birth year", min_value=1940, max_value=2026, value=2003, step=1)
+
+# Common settings
 allow_repeats = st.sidebar.toggle("Allow repeat recommendations", value=True)
-top_k = st.sidebar.slider("Top-K", min_value=1, max_value=20, value=10)
-
-if mode.startswith("Existing"):
-    user_id = st.sidebar.text_input("User ID (encrypted_user)")
+top_k = st.sidebar.slider("Top-K recommendations", min_value=1, max_value=20, value=10)
+repurchase_boost = st.sidebar.slider("Repurchase boost (for existing users)", min_value=1.0, max_value=2.0, value=1.2, step=0.1)
 
 # ---------- Main: image input ----------
 col1, col2 = st.columns([1, 1])
@@ -78,7 +125,7 @@ with col2:
         )
         st.dataframe(score_df, width='stretch')
 
-        # predicted concern IDs (may be empty until you update LABEL_TO_CONCERN_ID)
+        # predicted concern IDs
         predicted_concerns = pred.concern_ids or []
 
         if not predicted_concerns:
@@ -99,7 +146,8 @@ with col2:
         chosen = st.multiselect(
             "Use these concern IDs for recommendation:",
             options=all_cids,
-            default=predicted_concerns
+            default=predicted_concerns,
+            format_func=lambda x: f"{x} - {CONCERN_ID_TO_NAME.get(x, str(x))}"
         )
         chosen = sorted(list(set(chosen)))
 
@@ -107,34 +155,78 @@ with col2:
             st.info("Pick at least 1 concern ID to generate recommendations.")
             st.stop()
 
-        # Recommend
-        recs = rec.recommend(
+        # ---------- Recommendations: 2 sections ----------
+        st.markdown("---")
+        st.markdown("## 3) Recommendations")
+
+        # === B1: Concern-based CF ===
+        st.markdown("### Recommend for your skin concern")
+        st.caption("Products matching your analyzed skin concerns")
+        
+        recs_concern = rec.recommend_by_concern(
             selected_concern_ids=chosen,
             top_k=top_k,
             allow_repeats=allow_repeats,
             user_id=user_id if user_id else None,
             gender=gender,
             birth_year=int(birth_year),
+            repurchase_boost=repurchase_boost,
         )
 
-        st.markdown("### 3) Recommendations")
-
-        if not recs:
+        if not recs_concern:
             st.info("No recommendations found. Try adding concerns or relaxing filters.")
-            st.stop()
+        else:
+            rec_df = pd.DataFrame([
+                {"item_number": r.item_number, "score": r.score, "reason": r.reason} 
+                for r in recs_concern
+            ])
+            show = rec_df.merge(item_meta, on="item_number", how="left")
+            st.dataframe(
+                show[["item_number", "skin_concern_cat_name", "score", "reason"]],
+                width='stretch'
+            )
+            st.download_button(
+                "Download concern-based results (CSV)",
+                data=show.to_csv(index=False).encode("utf-8"),
+                file_name="recommendations_concern.csv",
+                mime="text/csv"
+            )
 
-        # Join with item meta for display
-        rec_df = pd.DataFrame([{"item_number": r.item_number, "score": r.score, "reason": r.reason} for r in recs])
-        show = rec_df.merge(item_meta, on="item_number", how="left")
+        st.markdown("---")
 
-        st.dataframe(
-            show[["item_number", "skin_concern_cat_name", "score", "reason"]],
-            width='stretch'
-        )
+        # === B2: User-user similarity ===
+        st.markdown("### Users similar to you liked these products")
+        st.caption("Based on purchase patterns of similar users")
 
-        st.download_button(
-            "Download results (CSV)",
-            data=show.to_csv(index=False).encode("utf-8"),
-            file_name="recommendations.csv",
-            mime="text/csv"
-        )
+        if mode == "New user (no history)":
+            st.info("This section is available after you have purchase history.")
+        else:
+            # Existing user → use user-user similarity
+            if user_id is None:
+                st.warning("User ID not found.")
+            else:
+                recs_similar = rec.recommend_by_user_similarity(
+                    user_id=user_id,
+                    top_k=top_k,
+                    allow_repeats=allow_repeats,
+                    repurchase_boost=repurchase_boost,
+                )
+
+                if not recs_similar:
+                    st.info("No similar users found or no recommendations available.")
+                else:
+                    rec_df2 = pd.DataFrame([
+                        {"item_number": r.item_number, "score": r.score, "reason": r.reason} 
+                        for r in recs_similar
+                    ])
+                    show2 = rec_df2.merge(item_meta, on="item_number", how="left")
+                    st.dataframe(
+                        show2[["item_number", "skin_concern_cat_name", "score", "reason"]],
+                        width='stretch'
+                    )
+                    st.download_button(
+                        "Download similarity-based results (CSV)",
+                        data=show2.to_csv(index=False).encode("utf-8"),
+                        file_name="recommendations_similarity.csv",
+                        mime="text/csv"
+                    )

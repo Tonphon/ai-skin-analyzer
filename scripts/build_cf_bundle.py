@@ -13,16 +13,19 @@ SALES_PATH = "data/sales_fact_skincare_user_features_encrypted_item_number.csv"
 ITEM_MASTER_PATH = "data/item_master_with_skin_concern_cat.csv"
 OUT_PATH = "artifacts/cf_bundle.pkl"
 
-TRAIN_MONTHS = ["2025-07", "2025-08"]   # matches your notebook
-VALID_CONCERNS = [1, 2, 3, 4, 5]        # your 5 concern categories
-TOP_POP_PER_CONCERN = 200              # fallback list size
+TRAIN_MONTHS = ["2025-07", "2025-08"]
+VALID_CONCERNS = [1, 2, 3, 4, 5]
+TOP_POP_PER_CONCERN = 200
 
-CURRENT_YEAR_FOR_AGE = 2025            # used to create age group
+CURRENT_YEAR_FOR_AGE = 2025
 # ------------------------------------------------------
 
 
 def assign_age_group(age: int) -> str:
-    if age < 25:
+    """Updated age groups: 0-17, 18-24, 25-34, 35-44, 45-54, 55+"""
+    if age < 18:
+        return "0-17"
+    elif age < 25:
         return "18-24"
     elif age < 35:
         return "25-34"
@@ -43,7 +46,7 @@ def normalize_gender(x):
         return "F"
     if x in ["ชาย", "male", "Male", "M"]:
         return "M"
-    return x  # keep as-is if unknown
+    return x
 
 
 def main():
@@ -66,7 +69,7 @@ def main():
     # Keep only valid concerns 1..5
     df = df[df["skin_concern_cat_id"].isin(VALID_CONCERNS)].copy()
 
-    # Keep train months only (for CF artifacts)
+    # Keep train months only
     train = df[df["month_id"].isin(TRAIN_MONTHS)].copy()
 
     # Basic cleanup
@@ -82,11 +85,11 @@ def main():
         .copy()
     )
     demo["age"] = (CURRENT_YEAR_FOR_AGE - demo["birth_year"]).astype("Int64")
-    demo["age_group"] = demo["age"].fillna(30).astype(int).apply(assign_age_group)  # fallback if missing
+    demo["age_group"] = demo["age"].fillna(30).astype(int).apply(assign_age_group)
 
     user_demographics = demo[["encrypted_user", "gender", "age_group"]].copy()
 
-    # ---- Primary concern from train history (optional / for analysis) ----
+    # ---- Primary concern from train history ----
     user_concern_qty = (
         train.groupby(["encrypted_user", "skin_concern_cat_id"])["sales_quantity"]
         .sum()
@@ -97,8 +100,7 @@ def main():
     user_demographics = user_demographics.merge(primary[["encrypted_user", "primary_concern"]],
                                                 on="encrypted_user", how="left")
 
-    # ---- Build user-item matrix (dense DataFrame is OK here; your data is small) ----
-    # rows: users, cols: items, values: sum quantity
+    # ---- Build user-item matrix ----
     user_item_matrix = (
         train.groupby(["encrypted_user", "item_number"])["sales_quantity"]
         .sum()
@@ -106,11 +108,10 @@ def main():
     )
 
     # ---- User-user cosine similarity ----
-    # (n_users ~ 1256 in your data, so full matrix is fine)
     sim = cosine_similarity(user_item_matrix.values)
     user_similarity_df = pd.DataFrame(sim, index=user_item_matrix.index, columns=user_item_matrix.index)
 
-    # ---- Train purchases set (for allow_repeats / exclusion) ----
+    # ---- Train purchases set ----
     train_user_purchases = (
         train.groupby("encrypted_user")["item_number"]
         .apply(lambda x: set(map(int, x.tolist())))
@@ -130,7 +131,7 @@ def main():
         top_items = pop.loc[pop["skin_concern_cat_id"] == cid, "item_number"].head(TOP_POP_PER_CONCERN)
         popular_by_concern[cid] = list(map(int, top_items.tolist()))
 
-    # ---- Item meta (for joining/display) ----
+    # ---- Item meta ----
     item_meta = item_master.copy()
 
     bundle = {
