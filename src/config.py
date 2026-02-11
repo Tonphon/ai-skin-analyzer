@@ -1,6 +1,4 @@
 # src/config.py
-MODEL_ARCH = "efficientnet_v2_s"
-
 
 CLASS_NAMES = [
     "Dark Circle",
@@ -14,13 +12,13 @@ CLASS_NAMES = [
 
 
 LABEL_TO_CONCERN_ID = {
-    "Dark Circle": 1,   # Whitening
     "PIH": 1,           # Whitening
-    "blackhead": 2,     # Anti-Aging
-    "papule": 3,        # Acne & Oily
-    "pustule": 3,       # Acne & Oily
-    "whitehead": 4,     # Eye Care
-    "wrinkle": 5        # Sensitive Skin
+    "wrinkle": 2,       # Anti-Aging
+    "blackhead": 3,     # Acne & Oily
+    "whitehead": 3,     # Acne & Oily
+    "Dark Circle": 4,   # Eye Care
+    "papule": 5,        # Sensitive Skin
+    "pustule": 5        # Sensitive Skin
 }
 
 

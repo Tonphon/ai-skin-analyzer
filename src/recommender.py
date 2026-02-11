@@ -13,7 +13,8 @@ class RecItem:
     reason: str
 
 def _assign_age_group(age: int) -> str:
-    if age < 25: return "18-24"
+    if age < 18: return "0-17"
+    elif age < 25: return "18-24"
     elif age < 35: return "25-34"
     elif age < 45: return "35-44"
     elif age < 55: return "45-54"
@@ -24,23 +25,37 @@ class Recommender:
         with open(bundle_path, "rb") as f:
             bundle = pickle.load(f)
 
-        # expected keys inside bundle
-        self.user_item_matrix = bundle["user_item_matrix"]     # pd.DataFrame (users x items)
-        self.user_similarity_df = bundle["user_similarity_df"] # pd.DataFrame (users x users)
-        self.user_demographics = bundle["user_demographics"]   # pd.DataFrame: encrypted_user, gender, age_group, (optional) primary concern
-        self.train_user_purchases = bundle["train_user_purchases"]  # dict user -> set(items)
-        self.item_meta = bundle["item_meta"]                   # pd.DataFrame with item_number, skin_concern_cat_id, name/brand(optional)
-        self.popular_by_concern = bundle["popular_by_concern"] # dict concern_id -> list[item_number]
+        self.user_item_matrix = bundle["user_item_matrix"]
+        self.user_similarity_df = bundle["user_similarity_df"]
+        self.user_demographics = bundle["user_demographics"]
+        self.train_user_purchases = bundle["train_user_purchases"]
+        self.item_meta = bundle["item_meta"]
+        self.popular_by_concern = bundle["popular_by_concern"]
 
         # quick map item -> concern id
         self.item_to_concern = dict(zip(self.item_meta["item_number"], self.item_meta["skin_concern_cat_id"]))
 
+    def get_all_users(self) -> List[str]:
+        """Return list of all user IDs in the system."""
+        return sorted(self.user_demographics["encrypted_user"].astype(str).tolist())
+
+    def get_user_demographics(self, user_id: str) -> Optional[Dict]:
+        """Fetch demographics for a specific user."""
+        row = self.user_demographics[self.user_demographics["encrypted_user"].astype(str) == str(user_id)]
+        if len(row) == 0:
+            return None
+        return {
+            "gender": row["gender"].iloc[0],
+            "age_group": row["age_group"].iloc[0],
+        }
+
     def _get_candidate_users(self, gender: str, age_group: str) -> List[str]:
+        """Get users matching gender and age_group."""
         df = self.user_demographics
         df2 = df[(df["gender"] == gender) & (df["age_group"] == age_group)]
         return df2["encrypted_user"].astype(str).tolist()
 
-    def recommend(
+    def recommend_by_concern(
         self,
         selected_concern_ids: List[int],
         top_k: int,
@@ -51,17 +66,20 @@ class Recommender:
         current_year: int = 2025,
         top_neighbors: int = 50,
         min_sim: float = 0.05,
+        repurchase_boost: float = 1.2,
     ) -> List[RecItem]:
-
+        """
+        B1: Concern-based CF recommendation.
+        Uses concern IDs from image analysis + demographic matching.
+        """
         selected_concern_ids = sorted(list(set(selected_concern_ids)))
         if not selected_concern_ids:
             return []
 
-        # If we have an existing user with history -> CF
+        # If existing user with history → CF
         if user_id is not None and user_id in self.user_similarity_df.index:
-            # determine demo group (gender/age_group)
+            # Get demo group
             if gender is None or birth_year is None:
-                # try fetch from demographics table
                 row = self.user_demographics[self.user_demographics["encrypted_user"].astype(str) == str(user_id)]
                 if len(row):
                     gender = row["gender"].iloc[0]
@@ -88,14 +106,13 @@ class Recommender:
             item_scores = defaultdict(float)
 
             for sim_user, w in sims.items():
-                # aggregate items from similar users
                 if sim_user not in self.user_item_matrix.index:
                     continue
                 vec = self.user_item_matrix.loc[sim_user]
                 for item, qty in vec.items():
                     if qty <= 0:
                         continue
-                    # concern filter comes from IMAGE prediction
+                    # Filter by concern
                     cid = self.item_to_concern.get(item)
                     if cid not in selected_concern_ids:
                         continue
@@ -103,24 +120,92 @@ class Recommender:
                         continue
                     item_scores[item] += float(w) * float(qty)
 
-            # optional repurchase boost
+            # Repurchase boost
             if allow_repeats and user_id in self.train_user_purchases:
                 own = self.train_user_purchases[user_id]
                 for item in list(own):
                     if item in item_scores:
-                        item_scores[item] *= 1.2
+                        item_scores[item] *= repurchase_boost
 
             ranked = sorted(item_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
             return [
-                RecItem(item_number=int(i), score=float(s), reason="CF: similar users bought it")
+                RecItem(item_number=int(i), score=float(s), reason="CF: similar users with same concerns")
                 for i, s in ranked
             ]
 
-        # Otherwise -> cold-start fallback
+        # New user or no history → fallback
         return self._fallback_popular(selected_concern_ids, top_k)
 
+    def recommend_by_user_similarity(
+        self,
+        user_id: str,
+        top_k: int,
+        allow_repeats: bool,
+        top_neighbors: int = 50,
+        min_sim: float = 0.05,
+        repurchase_boost: float = 1.2,
+    ) -> List[RecItem]:
+        """
+        B2: User-user similarity recommendation.
+        Ignores skin concerns; purely based on purchase patterns.
+        Only for existing users.
+        """
+        if user_id not in self.user_similarity_df.index:
+            return []
+
+        # Get user demographics
+        demo = self.get_user_demographics(user_id)
+        if demo is None:
+            return []
+
+        gender = demo["gender"]
+        age_group = demo["age_group"]
+
+        # Get candidate users (same gender + age group)
+        candidates = self._get_candidate_users(gender, age_group)
+        candidates = [u for u in candidates if u != user_id and u in self.user_similarity_df.columns]
+
+        if not candidates:
+            return []
+
+        # Get similarity scores
+        sims = self.user_similarity_df.loc[user_id, candidates].sort_values(ascending=False)
+        sims = sims[sims >= min_sim].head(top_neighbors)
+
+        if sims.empty:
+            return []
+
+        already = set() if allow_repeats else self.train_user_purchases.get(user_id, set())
+        item_scores = defaultdict(float)
+
+        # Aggregate items from similar users
+        for sim_user, w in sims.items():
+            if sim_user not in self.user_item_matrix.index:
+                continue
+            vec = self.user_item_matrix.loc[sim_user]
+            for item, qty in vec.items():
+                if qty <= 0:
+                    continue
+                if item in already:
+                    continue
+                # No concern filtering here
+                item_scores[item] += float(w) * float(qty)
+
+        # Repurchase boost
+        if allow_repeats and user_id in self.train_user_purchases:
+            own = self.train_user_purchases[user_id]
+            for item in list(own):
+                if item in item_scores:
+                    item_scores[item] *= repurchase_boost
+
+        ranked = sorted(item_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        return [
+            RecItem(item_number=int(i), score=float(s), reason="Similar users also purchased")
+            for i, s in ranked
+        ]
+
     def _fallback_popular(self, concern_ids: List[int], top_k: int) -> List[RecItem]:
-        # interleave popular lists across concerns so multi-concern results feel balanced
+        """Fallback: interleave popular items across concerns."""
         pools = [self.popular_by_concern.get(cid, []) for cid in concern_ids]
         out = []
         seen = set()
@@ -128,14 +213,14 @@ class Recommender:
 
         while len(out) < top_k and any(ptrs[i] < len(pools[i]) for i in range(len(pools))):
             for i in range(len(pools)):
-                if ptrs[i] >= len(pools[i]): 
+                if ptrs[i] >= len(pools[i]):
                     continue
                 item = pools[i][ptrs[i]]
                 ptrs[i] += 1
                 if item in seen:
                     continue
                 seen.add(item)
-                out.append(RecItem(item_number=int(item), score=0.0, reason=f"Fallback: popular in concern {concern_ids[i]}"))
+                out.append(RecItem(item_number=int(item), score=0.0, reason=f"Popular in concern {concern_ids[i]}"))
                 if len(out) >= top_k:
                     break
 
