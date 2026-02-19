@@ -10,7 +10,7 @@ st.set_page_config(page_title="Skin Analyzer + Recommender", layout="wide")
 
 @st.cache_resource
 def load_classifier():
-    return SkinConcernClassifier("models/best_model.pth", device="cpu")
+    return SkinConcernClassifier("models/convnext_224.pth", device="cpu", arch="convnextv2_tiny")
 
 @st.cache_resource
 def load_recommender():
@@ -107,7 +107,7 @@ with col1:
         img = Image.open(up)
 
     if img:
-        st.image(img, caption="Input image", width='stretch')
+        st.image(img, caption="Input image", use_container_width=True)
 
 analyze_btn = st.button("Analyze → Recommend", type="primary", disabled=(img is None))
 
@@ -123,7 +123,7 @@ with col2:
             pd.DataFrame(pred.label_scores.items(), columns=["label", "score"])
             .sort_values("score", ascending=False)
         )
-        st.dataframe(score_df, width='stretch')
+        st.dataframe(score_df, use_container_width=True)
 
         # predicted concern IDs
         predicted_concerns = pred.concern_ids or []
@@ -183,7 +183,7 @@ with col2:
             show = rec_df.merge(item_meta, on="item_number", how="left")
             st.dataframe(
                 show[["item_number", "skin_concern_cat_name", "score", "reason"]],
-                width='stretch'
+                use_container_width=True
             )
             st.download_button(
                 "Download concern-based results (CSV)",
@@ -222,7 +222,7 @@ with col2:
                     show2 = rec_df2.merge(item_meta, on="item_number", how="left")
                     st.dataframe(
                         show2[["item_number", "skin_concern_cat_name", "score", "reason"]],
-                        width='stretch'
+                        use_container_width=True
                     )
                     st.download_button(
                         "Download similarity-based results (CSV)",
