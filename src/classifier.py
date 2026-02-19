@@ -17,14 +17,14 @@ from src.config import (
     LABEL_TO_CONCERN_ID,
 )
 
+# NEW: timm for ConvNeXt-v2
+import timm
+
 
 @dataclass
 class Prediction:
-    # used by app.py
     label_scores: Dict[str, float]
     concern_ids: List[int]
-
-    # extra (optional)
     labels: List[str]
     scores: List[float]
     positive_labels: List[str]
@@ -33,13 +33,6 @@ class Prediction:
 
 
 def _load_labels_json(path: str) -> List[str]:
-    """
-    Accepts models/labels.json in any of these shapes:
-      - ["a", "b", "c"]
-      - {"classes": ["a","b","c"]}
-      - {"class_names": ["a","b","c"]}
-      - {"labels": ["a","b","c"]}
-    """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -62,24 +55,20 @@ def _load_labels_json(path: str) -> List[str]:
 
 
 def _extract_state_dict(ckpt: object) -> Dict[str, torch.Tensor]:
-    """
-    Handles checkpoints saved as:
-      - OrderedDict / plain state_dict
-      - dict with keys like model_state_dict / state_dict / model / net
-    """
     if isinstance(ckpt, dict):
-        # common training save formats
         for key in ("model_state_dict", "state_dict", "model", "net", "model_state"):
             if key in ckpt and isinstance(ckpt[key], dict):
                 return ckpt[key]
-        # some people save {"...weights...": tensor} directly but also include metadata
-        # If it looks like a state dict (many tensor values), keep only tensor entries.
+
         tensor_items = {k: v for k, v in ckpt.items() if torch.is_tensor(v)}
         if tensor_items:
             return tensor_items
 
-    if isinstance(ckpt, dict):
         raise RuntimeError(f"Checkpoint dict format not recognized. Top-level keys: {list(ckpt.keys())[:20]}")
+
+    if isinstance(ckpt, (dict,)):
+        raise RuntimeError(f"Checkpoint format not supported. Got: {type(ckpt)}")
+
     raise RuntimeError(f"Checkpoint format not supported. Got: {type(ckpt)}")
 
 
@@ -94,6 +83,50 @@ def _clean_state_dict_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Te
     return cleaned
 
 
+def _infer_arch_from_state_keys(state: Dict[str, torch.Tensor]) -> Optional[str]:
+    # ConvNeXt-v2 checkpoints in your error look like: backbone.stem..., backbone.stages..., backbone.head.norm...
+    keys = list(state.keys())
+    if any(k.startswith("backbone.stem") or k.startswith("backbone.stages") for k in keys):
+        # guess tiny/base/large by classifier in_features if available
+        w = state.get("classifier.1.weight")
+        if isinstance(w, torch.Tensor) and w.ndim == 2:
+            in_features = w.shape[1]
+            if in_features == 768:
+                return "convnextv2_tiny"
+            if in_features == 1024:
+                return "convnextv2_base"
+            if in_features == 1536:
+                return "convnextv2_large"
+        # fallback
+        return "convnextv2_tiny"
+    return None
+
+
+class _ConvNeXtV2Wrapper(nn.Module):
+    """
+    Matches checkpoints that store:
+      backbone.*  +  classifier.1.weight/bias
+    (no classifier.0 params in the checkpoint)
+    """
+    def __init__(self, backbone_name: str, num_classes: int):
+        super().__init__()
+        self.backbone = timm.create_model(backbone_name, pretrained=False, num_classes=0)
+
+        feat_dim = getattr(self.backbone, "num_features", None)
+        if feat_dim is None:
+            raise RuntimeError("timm model missing num_features; check timm version / backbone name.")
+
+        self.classifier = nn.Sequential(
+            nn.Identity(),
+            nn.Linear(feat_dim, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats = self.backbone.forward_features(x)
+        feats = self.backbone.forward_head(feats, pre_logits=True)
+        return self.classifier(feats)
+
+
 class SkinConcernClassifier:
     def __init__(
         self,
@@ -102,11 +135,11 @@ class SkinConcernClassifier:
         labels_path: str = "models/labels.json",
         class_names: Optional[List[str]] = None,
         img_size: int = IMG_SIZE,
-        arch: str = "efficientnet_v2_s",
+        arch: Optional[str] = None,  # allow auto-detect
     ):
         self.device = torch.device(device)
 
-        # 1) Labels: prefer explicit class_names, else labels.json, else fallback to empty (error)
+        # 1) Labels
         if class_names is not None:
             self.class_names = [str(x).strip() for x in class_names if str(x).strip()]
         else:
@@ -114,40 +147,47 @@ class SkinConcernClassifier:
                 self.class_names = _load_labels_json(labels_path)
             else:
                 raise ValueError(
-                    f"labels_path not found: {labels_path}. "
-                    f"Create it (models/labels.json) or pass class_names=[...]."
+                    f"labels_path not found: {labels_path}. Create it (models/labels.json) or pass class_names=[...]."
                 )
 
         if not self.class_names:
             raise ValueError("No class names found.")
 
-        # 2) Build model (keep your current choice; supports b0 too if you switch later)
-        arch = (arch or "").lower().strip()
-        if arch == "efficientnet_v2_s":
-            self.model = models.efficientnet_v2_s(weights=None)
-        elif arch == "efficientnet_b0":
-            self.model = models.efficientnet_b0(weights=None)
-        else:
-            raise ValueError(f"Unsupported arch: {arch}. Use 'efficientnet_v2_s' or 'efficientnet_b0'.")
+        # 2) Load checkpoint first (so we can auto-detect arch cleanly)
+        # PyTorch 2.6+ changed weights_only default; we try safe load then fallback (only if you trust the ckpt).
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu")  # works for plain state_dict .pth
+        except Exception:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-        # 3) Replace final layer to match #labels
-        if not isinstance(self.model.classifier, nn.Sequential) or not isinstance(self.model.classifier[-1], nn.Linear):
-            raise RuntimeError("Unexpected EfficientNet classifier structure.")
-        in_features = self.model.classifier[-1].in_features
-        self.model.classifier[-1] = nn.Linear(in_features, len(self.class_names))
-
-        # 4) Load checkpoint robustly
-        ckpt = torch.load(ckpt_path, map_location="cpu")
         state = _extract_state_dict(ckpt)
         state = _clean_state_dict_keys(state)
 
-        # strict=True because we *want* to fail if arch/labels mismatch
+        # 3) Decide arch
+        arch = (arch or "").lower().strip() or _infer_arch_from_state_keys(state) or "efficientnet_v2_s"
+
+        # 4) Build model
+        if arch.startswith("convnextv2"):
+            # timm uses names like "convnextv2_tiny"
+            self.model = _ConvNeXtV2Wrapper(arch, num_classes=len(self.class_names))
+        elif arch == "efficientnet_v2_s":
+            self.model = models.efficientnet_v2_s(weights=None)
+            in_features = self.model.classifier[-1].in_features
+            self.model.classifier[-1] = nn.Linear(in_features, len(self.class_names))
+        elif arch == "efficientnet_b0":
+            self.model = models.efficientnet_b0(weights=None)
+            in_features = self.model.classifier[-1].in_features
+            self.model.classifier[-1] = nn.Linear(in_features, len(self.class_names))
+        else:
+            raise ValueError(f"Unsupported arch: {arch}")
+
+        # 5) Load weights (strict=True so you immediately know if model/ckpt mismatch)
         self.model.load_state_dict(state, strict=True)
 
         self.model.to(self.device)
         self.model.eval()
 
-        # 5) Preprocess
+        # 6) Preprocess (keep same unless your training used different normalization)
         self.preprocess = transforms.Compose(
             [
                 transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
@@ -158,7 +198,6 @@ class SkinConcernClassifier:
 
     @staticmethod
     def _labels_to_concern_ids(labels: List[str]) -> List[int]:
-        # Map labels -> concern IDs, unique + sorted for stable UI
         ids: List[int] = []
         for lb in labels:
             cid = LABEL_TO_CONCERN_ID.get(lb)
@@ -190,18 +229,12 @@ class SkinConcernClassifier:
         scores = scores_t.detach().cpu().tolist()
         label_scores = {label: float(score) for label, score in zip(self.class_names, scores)}
 
-        # Top-k (default = all labels)
-        if topk is None:
-            k = len(self.class_names)
-        else:
-            k = min(max(1, int(topk)), len(self.class_names))
-
+        k = len(self.class_names) if topk is None else min(max(1, int(topk)), len(self.class_names))
         top_scores_t, top_idx_t = torch.topk(scores_t, k=k)
         top_scores = top_scores_t.detach().cpu().tolist()
         top_idx = top_idx_t.detach().cpu().tolist()
         top_labels = [self.class_names[i] for i in top_idx]
 
-        # concern_ids: multilabel uses positives; multiclass uses top1
         if mode == "multilabel":
             concern_ids = self._labels_to_concern_ids(positive_labels)
         else:
