@@ -5,3 +5,4 @@ pillow
 pandas
 numpy
 scikit-learn
+timm
