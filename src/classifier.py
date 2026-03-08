@@ -12,7 +12,7 @@ from PIL import Image
 
 from src.config import (
     MODEL_MODE,
-    MULTILABEL_THRESHOLD,
+    CLASS_THRESHOLDS,
     IMG_SIZE,
     LABEL_TO_CONCERN_ID,
 )
@@ -219,8 +219,15 @@ class SkinConcernClassifier:
 
         if mode == "multilabel":
             scores_t = torch.sigmoid(logits)
-            threshold = float(MULTILABEL_THRESHOLD)
-            positive_idx = (scores_t >= threshold).nonzero(as_tuple=False).flatten().tolist()
+
+            # Per-class thresholds (NO fallback)
+            thresholds_t = torch.tensor(
+                [float(CLASS_THRESHOLDS[name]) for name in self.class_names],
+                device=scores_t.device,
+                dtype=scores_t.dtype,
+            )
+
+            positive_idx = (scores_t >= thresholds_t).nonzero(as_tuple=False).flatten().tolist()
             positive_labels = [self.class_names[i] for i in positive_idx]
         else:
             scores_t = torch.softmax(logits, dim=0)

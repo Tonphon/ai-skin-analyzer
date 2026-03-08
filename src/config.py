@@ -21,9 +21,17 @@ LABEL_TO_CONCERN_ID = {
     "pustule": 5        # Sensitive Skin
 }
 
+CLASS_THRESHOLDS = {
+    "Dark Circle": 0.50,
+    "PIH": 0.50,
+    "blackhead": 0.30,
+    "papule": 0.35,
+    "pustule": 0.40,
+    "whitehead": 0.50,
+    "wrinkle": 0.45,
+}
 
 MODEL_MODE = "multilabel"
-MULTILABEL_THRESHOLD = 0.40
 IMG_SIZE = 224
 
 # Concern ID -> display name
