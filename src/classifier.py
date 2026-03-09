@@ -17,9 +17,6 @@ from src.config import (
     LABEL_TO_CONCERN_ID,
 )
 
-# NEW: timm for ConvNeXt-v2
-import timm
-
 
 @dataclass
 class Prediction:
@@ -55,6 +52,11 @@ def _load_labels_json(path: str) -> List[str]:
 
 
 def _extract_state_dict(ckpt: object) -> Dict[str, torch.Tensor]:
+    """
+    Supports:
+      - raw state_dict (OrderedDict / dict of tensors)
+      - checkpoint dict containing model_state_dict / state_dict / model
+    """
     if isinstance(ckpt, dict):
         for key in ("model_state_dict", "state_dict", "model", "net", "model_state"):
             if key in ckpt and isinstance(ckpt[key], dict):
@@ -64,67 +66,48 @@ def _extract_state_dict(ckpt: object) -> Dict[str, torch.Tensor]:
         if tensor_items:
             return tensor_items
 
-        raise RuntimeError(f"Checkpoint dict format not recognized. Top-level keys: {list(ckpt.keys())[:20]}")
-
-    if isinstance(ckpt, (dict,)):
-        raise RuntimeError(f"Checkpoint format not supported. Got: {type(ckpt)}")
+        raise RuntimeError(
+            "Checkpoint dict format not recognized. "
+            f"Top-level keys: {list(ckpt.keys())[:30]}"
+        )
 
     raise RuntimeError(f"Checkpoint format not supported. Got: {type(ckpt)}")
 
 
 def _clean_state_dict_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Strips common wrappers/prefixes so torchvision EfficientNet can load:
+      - module. (DDP)
+      - model.  (some training scripts)
+      - efficientnet. (some wrappers save under self.efficientnet)
+    """
     cleaned: Dict[str, torch.Tensor] = {}
     for k, v in state.items():
         nk = k
         for prefix in ("module.", "model."):
             if nk.startswith(prefix):
                 nk = nk[len(prefix):]
+
+        if nk.startswith("efficientnet."):
+            nk = nk[len("efficientnet."):]
+
         cleaned[nk] = v
     return cleaned
 
 
-def _infer_arch_from_state_keys(state: Dict[str, torch.Tensor]) -> Optional[str]:
-    # ConvNeXt-v2 checkpoints in your error look like: backbone.stem..., backbone.stages..., backbone.head.norm...
-    keys = list(state.keys())
-    if any(k.startswith("backbone.stem") or k.startswith("backbone.stages") for k in keys):
-        # guess tiny/base/large by classifier in_features if available
-        w = state.get("classifier.1.weight")
+def _infer_num_classes_from_state(state: Dict[str, torch.Tensor]) -> int:
+    """
+    For torchvision EfficientNet_v2_s: model.classifier is Sequential and last layer is Linear.
+    Common key: classifier.1.weight (or classifier.0.weight depending on how you replaced head).
+    """
+    for key in ("classifier.1.weight", "classifier.0.weight"):
+        w = state.get(key)
         if isinstance(w, torch.Tensor) and w.ndim == 2:
-            in_features = w.shape[1]
-            if in_features == 768:
-                return "convnextv2_tiny"
-            if in_features == 1024:
-                return "convnextv2_base"
-            if in_features == 1536:
-                return "convnextv2_large"
-        # fallback
-        return "convnextv2_tiny"
-    return None
-
-
-class _ConvNeXtV2Wrapper(nn.Module):
-    """
-    Matches checkpoints that store:
-      backbone.*  +  classifier.1.weight/bias
-    (no classifier.0 params in the checkpoint)
-    """
-    def __init__(self, backbone_name: str, num_classes: int):
-        super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=False, num_classes=0)
-
-        feat_dim = getattr(self.backbone, "num_features", None)
-        if feat_dim is None:
-            raise RuntimeError("timm model missing num_features; check timm version / backbone name.")
-
-        self.classifier = nn.Sequential(
-            nn.Identity(),
-            nn.Linear(feat_dim, num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.backbone.forward_features(x)
-        feats = self.backbone.forward_head(feats, pre_logits=True)
-        return self.classifier(feats)
+            return int(w.shape[0])
+    raise RuntimeError(
+        "Can't infer num_classes from checkpoint. "
+        "Expected classifier.1.weight or classifier.0.weight in state_dict."
+    )
 
 
 class SkinConcernClassifier:
@@ -135,7 +118,7 @@ class SkinConcernClassifier:
         labels_path: str = "models/labels.json",
         class_names: Optional[List[str]] = None,
         img_size: int = IMG_SIZE,
-        arch: Optional[str] = None,  # allow auto-detect
+        arch: str = "efficientnet_v2_s",  # final
     ):
         self.device = torch.device(device)
 
@@ -147,47 +130,48 @@ class SkinConcernClassifier:
                 self.class_names = _load_labels_json(labels_path)
             else:
                 raise ValueError(
-                    f"labels_path not found: {labels_path}. Create it (models/labels.json) or pass class_names=[...]."
+                    f"labels_path not found: {labels_path}. "
+                    "Create models/labels.json or pass class_names=[...]."
                 )
 
         if not self.class_names:
             raise ValueError("No class names found.")
 
-        # 2) Load checkpoint first (so we can auto-detect arch cleanly)
-        # PyTorch 2.6+ changed weights_only default; we try safe load then fallback (only if you trust the ckpt).
+        # 2) Load checkpoint (handle PyTorch 2.6+ weights_only change)
         try:
-            ckpt = torch.load(ckpt_path, map_location="cpu")  # works for plain state_dict .pth
+            ckpt = torch.load(ckpt_path, map_location="cpu")
         except Exception:
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         state = _extract_state_dict(ckpt)
         state = _clean_state_dict_keys(state)
 
-        # 3) Decide arch
-        arch = (arch or "").lower().strip() or _infer_arch_from_state_keys(state) or "efficientnet_v2_s"
+        # 3) Build model (EfficientNet only)
+        arch = (arch or "").lower().strip()
+        if arch != "efficientnet_v2_s":
+            raise ValueError(f"This classifier.py is finalized for efficientnet_v2_s only. Got: {arch}")
 
-        # 4) Build model
-        if arch.startswith("convnextv2"):
-            # timm uses names like "convnextv2_tiny"
-            self.model = _ConvNeXtV2Wrapper(arch, num_classes=len(self.class_names))
-        elif arch == "efficientnet_v2_s":
-            self.model = models.efficientnet_v2_s(weights=None)
-            in_features = self.model.classifier[-1].in_features
-            self.model.classifier[-1] = nn.Linear(in_features, len(self.class_names))
-        elif arch == "efficientnet_b0":
-            self.model = models.efficientnet_b0(weights=None)
-            in_features = self.model.classifier[-1].in_features
-            self.model.classifier[-1] = nn.Linear(in_features, len(self.class_names))
-        else:
-            raise ValueError(f"Unsupported arch: {arch}")
+        self.model = models.efficientnet_v2_s(weights=None)
 
-        # 5) Load weights (strict=True so you immediately know if model/ckpt mismatch)
+        # Replace head to match checkpoint/classes
+        num_classes_ckpt = _infer_num_classes_from_state(state)
+        in_features = self.model.classifier[-1].in_features
+        self.model.classifier[-1] = nn.Linear(in_features, num_classes_ckpt)
+
+        # Safety check: checkpoint classes should match labels.json count
+        if num_classes_ckpt != len(self.class_names):
+            raise RuntimeError(
+                f"Checkpoint num_classes={num_classes_ckpt} but labels.json has {len(self.class_names)}. "
+                "Fix models/labels.json to match the checkpoint head."
+            )
+
+        # 4) Load weights strictly
         self.model.load_state_dict(state, strict=True)
 
         self.model.to(self.device)
         self.model.eval()
 
-        # 6) Preprocess (keep same unless your training used different normalization)
+        # 5) Preprocess
         self.preprocess = transforms.Compose(
             [
                 transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),

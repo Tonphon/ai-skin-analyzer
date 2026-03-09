@@ -22,13 +22,13 @@ LABEL_TO_CONCERN_ID = {
 }
 
 CLASS_THRESHOLDS = {
-    "Dark Circle": 0.50,
-    "PIH": 0.50,
-    "blackhead": 0.30,
-    "papule": 0.35,
-    "pustule": 0.40,
-    "whitehead": 0.50,
-    "wrinkle": 0.45,
+    "Dark Circle": 0.65,
+    "PIH": 0.45,
+    "blackhead": 0.75,
+    "papule": 0.30,
+    "pustule": 0.50,
+    "whitehead": 0.80,
+    "wrinkle": 0.50,
 }
 
 MODEL_MODE = "multilabel"

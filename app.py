@@ -11,7 +11,7 @@ st.set_page_config(page_title="Skin Analyzer + Recommender", layout="wide")
 
 @st.cache_resource
 def load_classifier():
-    return SkinConcernClassifier("models/convnext_224.pth", device="cpu", arch="convnextv2_tiny")
+    return SkinConcernClassifier("models/best_model.pth", device="cpu", arch="efficientnet_v2_s")
 
 
 @st.cache_resource
@@ -124,7 +124,7 @@ with col2:
             pd.DataFrame(pred.label_scores.items(), columns=["label", "score"])
             .sort_values("score", ascending=False)
         )
-        st.dataframe(score_df, use_container_width=True)
+        st.dataframe(score_df, width='stretch')
 
         predicted_concerns = pred.concern_ids or []
 
