@@ -6,6 +6,5 @@ pandas
 numpy
 scikit-learn
 timm
-mediapipe==0.10.9
+mediapipe>=0.10.30
 opencv-python-headless
-numpy

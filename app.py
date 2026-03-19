@@ -13,9 +13,12 @@ from PIL import Image
 from src.classifier import SkinConcernClassifier
 from src.recommender import Recommender
 from src.config import CONCERN_ID_TO_NAME
+from src.concern_descriptions import get_all_descriptions_for_concerns
 
-# ── MediaPipe setup ───────────────────────────────────────────────────────────
-mp_face_mesh = mp.solutions.face_mesh
+# ── MediaPipe setup (Optional - for face angle detection) ────────────────────
+# Note: MediaPipe 0.10.30+ removed solutions API, so face detection is disabled
+USE_FACE_DETECTION = False
+# mp_face_mesh = None  # Not needed since face detection is disabled
 
 st.set_page_config(page_title="Skin Analyzer + Recommender", layout="wide")
 
@@ -40,6 +43,15 @@ st.markdown("""
 .warn-box { background: #1a1200; border: 1px solid #665500; border-radius: 8px; padding: 10px 14px; color: #ffcc00; font-size: 13px; margin-bottom: 10px; }
 .err-box  { background: #1a0a0a; border: 1px solid #4a1a1a; border-radius: 8px; padding: 10px 14px; color: #ff6666; font-size: 13px; margin-bottom: 10px; }
 .result-card { background: #0d1f18; border: 1px solid #1a4a30; border-radius: 12px; padding: 28px; text-align: center; margin-top: 16px; }
+
+/* Concern description styles */
+.concern-badge { display: inline-block; padding: 4px 12px; border-radius: 16px; font-size: 12px; font-weight: 600; 
+                 margin-right: 8px; margin-bottom: 8px; }
+.concern-badge.whitening { background: #fff3e0; color: #e65100; }
+.concern-badge.anti-aging { background: #f3e5f5; color: #6a1b9a; }
+.concern-badge.acne { background: #e8f5e9; color: #2e7d32; }
+.concern-badge.eye-care { background: #e3f2fd; color: #1565c0; }
+.concern-badge.sensitive { background: #fce4ec; color: #c2185b; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -48,68 +60,18 @@ st.markdown("""
 
 def analyze_face(image_rgb: np.ndarray) -> dict | None:
     """Returns yaw (degrees) and coverage (% of image area), or None if no face detected."""
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True, max_num_faces=1,
-        refine_landmarks=True, min_detection_confidence=0.5,
-    ) as face_mesh:
-        results = face_mesh.process(image_rgb)
-
-    if not results.multi_face_landmarks:
-        return None
-
-    lm = results.multi_face_landmarks[0].landmark
-    h, w = image_rgb.shape[:2]
-
-    # Yaw via solvePnP
-    model_pts = np.array([
-        (0.0,    0.0,    0.0),
-        (0.0,   -63.6,  -12.5),
-        (-43.3,  32.7,  -26.0),
-        (43.3,   32.7,  -26.0),
-        (-28.9, -28.9,  -24.1),
-        (28.9,  -28.9,  -24.1),
-    ], dtype=np.float64)
-    idxs = [1, 152, 226, 446, 57, 287]
-    img_pts = np.array([(lm[i].x * w, lm[i].y * h) for i in idxs], dtype=np.float64)
-    focal = w
-    cam = np.array([[focal, 0, w / 2], [0, focal, h / 2], [0, 0, 1]], dtype=np.float64)
-    _, rvec, _ = cv2.solvePnP(model_pts, img_pts, cam, np.zeros((4, 1)),
-                               flags=cv2.SOLVEPNP_ITERATIVE)
-    rmat, _ = cv2.Rodrigues(rvec)
-    angles, *_ = cv2.RQDecomp3x3(rmat)
-    yaw = angles[1]
-
-    # Coverage via bounding box of all landmarks
-    xs = [l.x for l in lm]
-    ys = [l.y for l in lm]
-    box_w = (max(xs) - min(xs)) * w
-    box_h = (max(ys) - min(ys)) * h
-    coverage = (box_w * box_h) / (w * h) * 100
-
-    return {"yaw": yaw, "coverage": coverage}
+    # Face detection disabled due to MediaPipe API changes
+    # Return None to skip face angle validation
+    return None
 
 
 def check_pose(yaw: float, step: int) -> tuple[bool, str]:
-    targets = {0: (0, 20), 1: (-45, 25), 2: (45, 25)}
-    target, tol = targets[step]
-    if abs(yaw - target) <= tol:
-        return True, ""
-    if step == 0:
-        msg = f"Turn a little to the right ({yaw:.0f}°)" if yaw < target - tol else f"Turn a little to the left ({yaw:.0f}°)"
-        return False, msg + " — try facing more straight ahead"
-    elif step == 1:
-        msg = f"Not enough ({yaw:.0f}°) — turn your head further left" if yaw > target + tol else f"Too far ({yaw:.0f}°) — turn back slightly"
-        return False, msg
-    else:
-        msg = f"Not enough ({yaw:.0f}°) — turn your head further right" if yaw < target - tol else f"Too far ({yaw:.0f}°) — turn back slightly"
-        return False, msg
+    # Face detection disabled - always return True
+    return True, ""
 
 
 def check_coverage(cov: float) -> tuple[bool, str]:
-    if cov < 5:
-        return False, f"Move closer to the camera — face covers {cov:.0f}% of frame (target: 10-30%)"
-    elif cov > 40:
-        return False, f"Move further from the camera — face covers {cov:.0f}% of frame (target: 10-30%)"
+    # Face detection disabled - always return True
     return True, ""
 
 
@@ -291,13 +253,52 @@ if st.session_state.step == 3:
     if all(s is not None for s in st.session_state.pred_scores):
         chosen = st.session_state.get("chosen_concerns", [])
 
-        st.markdown("### Detected skin concerns")
+        st.markdown("### 🔍 ผลการวิเคราะห์ปัญหาผิวหน้า")
+        
         if chosen:
-            st.write([f"{cid} - {CONCERN_ID_TO_NAME.get(cid, str(cid))}" for cid in chosen])
+            # Get all positive labels from all 3 photos
+            all_positive_labels = set()
+            for scores in st.session_state.pred_scores:
+                if scores:
+                    # Find labels that exceed their thresholds
+                    from src.config import CLASS_THRESHOLDS
+                    for label, score in scores.items():
+                        threshold = CLASS_THRESHOLDS.get(label, 0.5)
+                        if score >= threshold:
+                            all_positive_labels.add(label)
+            
+            if all_positive_labels:
+                # Get random descriptions for detected concerns
+                descriptions = get_all_descriptions_for_concerns(list(all_positive_labels))
+                
+                # Display each concern with its description
+                for label in sorted(all_positive_labels):
+                    desc = descriptions[label]
+                    
+                    # Create an expandable section for each concern
+                    with st.expander(f"✨ {desc['title']}", expanded=True):
+                        st.markdown(f"**คำอธิบาย:** {desc['description']}")
+                        st.markdown(f"**คำแนะนำ:** {desc['tips']}")
+                        
+                        # Show which photos detected this concern
+                        detected_in = []
+                        for i, scores in enumerate(st.session_state.pred_scores):
+                            if scores and label in scores:
+                                threshold = CLASS_THRESHOLDS.get(label, 0.5)
+                                if scores[label] >= threshold:
+                                    detected_in.append(f"ภาพที่ {i+1} ({scores[label]:.2%})")
+                        
+                        if detected_in:
+                            st.caption(f"🎯 ตรวจพบใน: {', '.join(detected_in)}")
+                
+                st.markdown("---")
+                st.info(f"💡 **สรุป:** ตรวจพบปัญหาผิวทั้งหมด {len(all_positive_labels)} ประเภท จาก {len(chosen)} กลุ่มปัญหาหลัก")
+            else:
+                st.info("ไม่พบปัญหาผิวที่เด่นชัดในภาพของคุณ ผิวของคุณดูดีอยู่แล้ว! 😊")
         else:
             st.warning(
-                "No concerns were detected from any of the 3 photos. "
-                "Please retake your photos and ensure your face is clearly visible."
+                "⚠️ ไม่สามารถตรวจจับปัญหาผิวได้จากภาพทั้ง 3 ภาพ "
+                "กรุณาถ่ายภาพใหม่และตรวจสอบให้แน่ใจว่าใบหน้าของคุณชัดเจน"
             )
             st.stop()
 
