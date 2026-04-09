@@ -1,21 +1,52 @@
 """
-pip install streamlit pillow mediapipe==0.10.9 opencv-python-headless numpy pandas
-streamlit run app.py
+Skin Analyzer + Recommender — combined app
+Face alignment uses dlib (shape_predictor_68_face_landmarks.dat).
+Concern descriptions are shown after analysis.
+
+Requirements:
+    pip install streamlit pillow opencv-python-headless dlib numpy pandas scikit-learn timm torch torchvision
+
+Run:
+    streamlit run app.py
 """
 import io
+import os
+import types
 import numpy as np
 import cv2
-import mediapipe as mp
+import dlib
 import streamlit as st
 import pandas as pd
 from PIL import Image
 
 from src.classifier import SkinConcernClassifier
 from src.recommender import Recommender
-from src.config import CONCERN_ID_TO_NAME
+from src.config import CONCERN_ID_TO_NAME, CLASS_THRESHOLDS
+from src.concern_descriptions import get_all_descriptions_for_concerns
 
-# ── MediaPipe setup ───────────────────────────────────────────────────────────
-mp_face_mesh = mp.solutions.face_mesh
+# ── dlib setup ────────────────────────────────────────────────────────────────
+_detector = dlib.get_frontal_face_detector()
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_predictor_path = os.path.join(_BASE_DIR, "shape_predictor_68_face_landmarks.dat")
+if not os.path.exists(_predictor_path):
+    st.error(
+        "Missing `shape_predictor_68_face_landmarks.dat` in the project root.\n\n"
+        "Download from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2\n"
+        "Extract and place the .dat file next to app.py."
+    )
+    st.stop()
+_predictor = dlib.shape_predictor(_predictor_path)
+
+# ── Oval / ellipse config ─────────────────────────────────────────────────────
+_CENTER_RATIO   = (0.5, 0.5)
+_AXES_RATIO     = (0.20, 0.45)
+_MAX_ANGLE_DEG  = 5       # max in-plane eye roll for front step
+_MIN_SIZE_RATIO = 0.98    # face must fill ≥98% of oval axes
+_FRONT_TURN_MAX = 0.10    # near-center for front photo
+_SIDE_TURN_MIN  = 0.12    # minimum normalized turn for side photo
+_SIDE_TURN_MAX  = 0.55    # maximum normalized turn for side photo
+_MAX_SIDE_ROLL  = 12      # allow a bit more tilt on side shots
+_STABLE_FRAMES  = 10
 
 st.set_page_config(page_title="Skin Analyzer + Recommender", layout="wide")
 
@@ -40,77 +71,170 @@ st.markdown("""
 .warn-box { background: #1a1200; border: 1px solid #665500; border-radius: 8px; padding: 10px 14px; color: #ffcc00; font-size: 13px; margin-bottom: 10px; }
 .err-box  { background: #1a0a0a; border: 1px solid #4a1a1a; border-radius: 8px; padding: 10px 14px; color: #ff6666; font-size: 13px; margin-bottom: 10px; }
 .result-card { background: #0d1f18; border: 1px solid #1a4a30; border-radius: 12px; padding: 28px; text-align: center; margin-top: 16px; }
+.concern-badge { display: inline-block; padding: 4px 12px; border-radius: 16px; font-size: 12px; font-weight: 600;
+                 margin-right: 8px; margin-bottom: 8px; }
+.concern-badge.whitening  { background: #fff3e0; color: #e65100; }
+.concern-badge.anti-aging { background: #f3e5f5; color: #6a1b9a; }
+.concern-badge.acne       { background: #e8f5e9; color: #2e7d32; }
+.concern-badge.eye-care   { background: #e3f2fd; color: #1565c0; }
+.concern-badge.sensitive  { background: #fce4ec; color: #c2185b; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Face analysis helpers (from implement.py) ─────────────────────────────────
+# ── Face analysis helpers (dlib) ──────────────────────────────────────────────
 
-def analyze_face(image_rgb: np.ndarray) -> dict | None:
-    """Returns yaw (degrees) and coverage (% of image area), or None if no face detected."""
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True, max_num_faces=1,
-        refine_landmarks=True, min_detection_confidence=0.5,
-    ) as face_mesh:
-        results = face_mesh.process(image_rgb)
-
-    if not results.multi_face_landmarks:
-        return None
-
-    lm = results.multi_face_landmarks[0].landmark
-    h, w = image_rgb.shape[:2]
-
-    # Yaw via solvePnP
-    model_pts = np.array([
-        (0.0,    0.0,    0.0),
-        (0.0,   -63.6,  -12.5),
-        (-43.3,  32.7,  -26.0),
-        (43.3,   32.7,  -26.0),
-        (-28.9, -28.9,  -24.1),
-        (28.9,  -28.9,  -24.1),
-    ], dtype=np.float64)
-    idxs = [1, 152, 226, 446, 57, 287]
-    img_pts = np.array([(lm[i].x * w, lm[i].y * h) for i in idxs], dtype=np.float64)
-    focal = w
-    cam = np.array([[focal, 0, w / 2], [0, focal, h / 2], [0, 0, 1]], dtype=np.float64)
-    _, rvec, _ = cv2.solvePnP(model_pts, img_pts, cam, np.zeros((4, 1)),
-                               flags=cv2.SOLVEPNP_ITERATIVE)
-    rmat, _ = cv2.Rodrigues(rvec)
-    angles, *_ = cv2.RQDecomp3x3(rmat)
-    yaw = angles[1]
-
-    # Coverage via bounding box of all landmarks
-    xs = [l.x for l in lm]
-    ys = [l.y for l in lm]
-    box_w = (max(xs) - min(xs)) * w
-    box_h = (max(ys) - min(ys)) * h
-    coverage = (box_w * box_h) / (w * h) * 100
-
-    return {"yaw": yaw, "coverage": coverage}
+def _get_eye_roll(shape_np: np.ndarray) -> float:
+    """In-plane roll angle from dlib eye landmarks (indices 36-47)."""
+    left_eye_center  = np.mean(shape_np[36:42], axis=0)
+    right_eye_center = np.mean(shape_np[42:48], axis=0)
+    dy = right_eye_center[1] - left_eye_center[1]
+    dx = right_eye_center[0] - left_eye_center[0]
+    return float(np.degrees(np.arctan2(dy, dx)))
 
 
-def check_pose(yaw: float, step: int) -> tuple[bool, str]:
-    targets = {0: (0, 20), 1: (-45, 25), 2: (45, 25)}
-    target, tol = targets[step]
-    if abs(yaw - target) <= tol:
-        return True, ""
+def _estimate_turn(shape_np: np.ndarray, face) -> float:
+    """Approximate left/right turn from nose position inside the face box.
+
+    This is a simple 2D heuristic:
+    - take the nose tip x-position (landmark 30)
+    - compare it with the horizontal center of the detected face box
+    - normalize by half the face width
+
+    Output is unitless, not true degrees.
+    Negative ~= subject turned left, positive ~= subject turned right.
+    """
+    nose_x = float(shape_np[30, 0])
+    face_center_x = (face.left() + face.right()) / 2.0
+    face_half_w = max((face.right() - face.left()) / 2.0, 1.0)
+    return float((nose_x - face_center_x) / face_half_w)
+
+
+def _evaluate_step_alignment(step: int, in_ellipse: bool, size_ok: bool, roll: float, turn: float) -> tuple[bool, str]:
+    base_ok = in_ellipse and size_ok
+
     if step == 0:
-        msg = f"Turn a little to the right ({yaw:.0f}°)" if yaw < target - tol else f"Turn a little to the left ({yaw:.0f}°)"
-        return False, msg + " — try facing more straight ahead"
-    elif step == 1:
-        msg = f"Not enough ({yaw:.0f}°) — turn your head further left" if yaw > target + tol else f"Too far ({yaw:.0f}°) — turn back slightly"
-        return False, msg
+        turn_ok = abs(turn) <= _FRONT_TURN_MAX
+        angle_ok = abs(roll) <= _MAX_ANGLE_DEG
+        if base_ok and turn_ok and angle_ok:
+            return True, "Face aligned ✅ Hold still..."
+        if not in_ellipse:
+            return False, "Move your face into the oval guide"
+        if not size_ok:
+            return False, "Move closer ❌ Face is too small"
+        if not turn_ok:
+            if turn < 0:
+                return False, "Turn slightly back to center from the left"
+            return False, "Turn slightly back to center from the right"
+        if roll > 0:
+            return False, "Head tilted right ❌ Straighten up"
+        return False, "Head tilted left ❌ Straighten up"
+
+    if step == 1:  # subject's left
+        turn_ok = (-_SIDE_TURN_MAX <= turn <= -_SIDE_TURN_MIN)
+        angle_ok = abs(roll) <= _MAX_SIDE_ROLL
+        if base_ok and turn_ok and angle_ok:
+            return True, "Left angle looks good ✅ Hold still..."
+        if not in_ellipse:
+            return False, "Keep your face inside the oval while turning left"
+        if not size_ok:
+            return False, "Move closer ❌ Face is too small"
+        if turn > -_SIDE_TURN_MIN:
+            return False, "Turn more to your left"
+        if turn < -_SIDE_TURN_MAX:
+            return False, "Turn a little back toward the center"
+        return False, "Keep your head more upright"
+
+    turn_ok = (_SIDE_TURN_MIN <= turn <= _SIDE_TURN_MAX)
+    angle_ok = abs(roll) <= _MAX_SIDE_ROLL
+    if base_ok and turn_ok and angle_ok:
+        return True, "Right angle looks good ✅ Hold still..."
+    if not in_ellipse:
+        return False, "Keep your face inside the oval while turning right"
+    if not size_ok:
+        return False, "Move closer ❌ Face is too small"
+    if turn < _SIDE_TURN_MIN:
+        return False, "Turn more to your right"
+    if turn > _SIDE_TURN_MAX:
+        return False, "Turn a little back toward the center"
+    return False, "Keep your head more upright"
+
+
+def analyze_face(image_rgb: np.ndarray, step: int) -> dict:
+    """Detect face with dlib and evaluate alignment for the current step."""
+    image_rgb = np.ascontiguousarray(image_rgb)
+    if image_rgb.dtype != np.uint8:
+        if np.issubdtype(image_rgb.dtype, np.floating):
+            if image_rgb.size and float(np.nanmax(image_rgb)) <= 1.0:
+                image_rgb = (image_rgb * 255).clip(0, 255).astype(np.uint8)
+            else:
+                image_rgb = np.nan_to_num(image_rgb, nan=0.0).clip(0, 255).astype(np.uint8)
+        else:
+            image_rgb = np.nan_to_num(image_rgb, nan=0.0).clip(0, 255).astype(np.uint8)
     else:
-        msg = f"Not enough ({yaw:.0f}°) — turn your head further right" if yaw < target - tol else f"Too far ({yaw:.0f}°) — turn back slightly"
-        return False, msg
+        image_rgb = image_rgb.copy()
 
+    if image_rgb.ndim == 2:
+        image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+    elif image_rgb.ndim == 3 and image_rgb.shape[2] == 4:
+        image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_RGBA2RGB)
+    elif image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+        raise ValueError(f"Unsupported image shape for face analysis: {image_rgb.shape}")
 
-def check_coverage(cov: float) -> tuple[bool, str]:
-    if cov < 5:
-        return False, f"Move closer to the camera — face covers {cov:.0f}% of frame (target: 10-30%)"
-    elif cov > 40:
-        return False, f"Move further from the camera — face covers {cov:.0f}% of frame (target: 10-30%)"
-    return True, ""
+    image_rgb = np.ascontiguousarray(image_rgb, dtype=np.uint8)
+
+    h, w = image_rgb.shape[:2]
+    img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    gray = np.ascontiguousarray(cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY), dtype=np.uint8)
+
+    ell_cx = int(w * _CENTER_RATIO[0])
+    ell_cy = int(h * _CENTER_RATIO[1])
+    ell_ax = int(w * _AXES_RATIO[0])
+    ell_ay = int(h * _AXES_RATIO[1])
+
+    faces = _detector(gray)
+    if len(faces) == 0:
+        cv2.ellipse(img_bgr, (ell_cx, ell_cy), (ell_ax, ell_ay), 0, 0, 360, (255, 255, 255), 4)
+        return {
+            "roll": 0.0,
+            "turn": 0.0,
+            "coverage": 0.0,
+            "in_ellipse": False,
+            "size_ok": False,
+            "face_ok": False,
+            "status_text": "No face detected",
+            "annotated_img": cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+        }
+
+    face = max(faces, key=lambda f: (f.right() - f.left()) * (f.bottom() - f.top()))
+    shape = _predictor(gray, face)
+    shape_np = np.array([[p.x, p.y] for p in shape.parts()])
+
+    cx = float(np.mean(shape_np[:, 0]))
+    cy = float(np.mean(shape_np[:, 1]))
+    face_w = face.right() - face.left()
+    face_h = face.bottom() - face.top()
+
+    in_ellipse = ((((cx - ell_cx) ** 2) / (ell_ax ** 2)) + (((cy - ell_cy) ** 2) / (ell_ay ** 2))) <= 1
+    size_ok = (face_w >= ell_ax * _MIN_SIZE_RATIO) and (face_h >= ell_ay * _MIN_SIZE_RATIO)
+    coverage = (face_w * face_h) / (w * h) * 100
+    roll = _get_eye_roll(shape_np)
+    turn = _estimate_turn(shape_np, face)
+
+    face_ok, status_text = _evaluate_step_alignment(step, in_ellipse, size_ok, roll, turn)
+    oval_color = (0, 255, 0) if face_ok else (0, 0, 255)
+    cv2.ellipse(img_bgr, (ell_cx, ell_cy), (ell_ax, ell_ay), 0, 0, 360, oval_color, 4)
+
+    return {
+        "roll": roll,
+        "turn": turn,
+        "coverage": coverage,
+        "in_ellipse": in_ellipse,
+        "size_ok": size_ok,
+        "face_ok": face_ok,
+        "status_text": status_text,
+        "annotated_img": cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB),
+    }
 
 
 # ── Cached resource loaders ───────────────────────────────────────────────────
@@ -122,7 +246,11 @@ def load_classifier():
 
 @st.cache_resource
 def load_recommender():
-    return Recommender("artifacts/cf_bundle.pkl")
+    try:
+        return Recommender("artifacts/cf_bundle.pkl")
+    except Exception as e:
+        st.error(f"Failed to load artifacts/cf_bundle.pkl: {type(e).__name__}: {e}")
+        st.stop()
 
 
 @st.cache_data
@@ -131,7 +259,6 @@ def load_item_meta():
 
 
 def _format_recs(recs, item_meta: pd.DataFrame) -> pd.DataFrame:
-    """Convert list of RecItem to a display-ready DataFrame."""
     if not recs:
         return pd.DataFrame()
     df = pd.DataFrame([{"item_number": r.item_number, "score": round(r.score, 4)} for r in recs])
@@ -146,16 +273,38 @@ clf       = load_classifier()
 rec       = load_recommender()
 item_meta = load_item_meta()
 
+# ── Fix: read-only numpy array in recommender's fill_diagonal ─────────────────
+# recommender.py calls np.fill_diagonal(group_sim.values, 0) but pandas can
+# return a read-only view. Patch np.fill_diagonal to copy before writing.
+_orig_fill_diagonal = np.fill_diagonal
+
+def _safe_fill_diagonal(a, val, wrap=False):
+    if isinstance(a, np.ndarray) and not a.flags.writeable:
+        # Can't fix in-place — caller needs a writable copy, but we can't
+        # reassign their local var. Best we can do: make a writable copy,
+        # fill it, then copy data back via flat iterator trick.
+        writeable = a.copy()
+        _orig_fill_diagonal(writeable, val, wrap)
+        a.setflags(write=True)
+        a[:] = writeable
+    else:
+        _orig_fill_diagonal(a, val, wrap)
+
+np.fill_diagonal = _safe_fill_diagonal
+
 # ── Session state ─────────────────────────────────────────────────────────────
-if "step"             not in st.session_state: st.session_state.step             = 0
-if "captures"         not in st.session_state: st.session_state.captures         = [None, None, None]
-if "cam_key"          not in st.session_state: st.session_state.cam_key          = 0
-if "pred_scores"      not in st.session_state: st.session_state.pred_scores      = [None, None, None]
-if "chosen_concerns"  not in st.session_state: st.session_state.chosen_concerns  = []
+if "step"            not in st.session_state: st.session_state.step            = 0
+if "captures"        not in st.session_state: st.session_state.captures        = [None, None, None]
+if "cam_key"         not in st.session_state: st.session_state.cam_key         = 0
+if "pred_scores"     not in st.session_state: st.session_state.pred_scores     = [None, None, None]
+if "chosen_concerns" not in st.session_state: st.session_state.chosen_concerns = []
+if "last_live_frame"   not in st.session_state: st.session_state.last_live_frame   = None
+if "last_capture_rgb"  not in st.session_state: st.session_state.last_capture_rgb  = None
+if "stable_ok_count"   not in st.session_state: st.session_state.stable_ok_count   = 0
 
 STEPS = [
     {"label": "Face Forward", "title": "Face the camera straight on",
-     "desc": "Look directly into the camera. Center your face in the frame so your forehead and chin are both visible.", "target_yaw": 0},
+     "desc": "Look directly into the camera. Center your face in the oval guide so your forehead and chin are both visible.", "target_yaw": 0},
     {"label": "Turn Left",    "title": "Turn your face to the left",
      "desc": "Turn your head approximately 45° to your left so your cheek and ear are clearly visible.", "target_yaw": -45},
     {"label": "Turn Right",   "title": "Turn your face to the right",
@@ -229,8 +378,7 @@ for i, col in enumerate(thumb_cols):
     with col:
         if st.session_state.captures[i] is not None:
             st.image(Image.open(io.BytesIO(st.session_state.captures[i])),
-                     caption=STEPS[i]["label"], use_container_width=True)
-            # Show classification scores for this photo if available
+                     caption=STEPS[i]["label"], width="stretch")
             scores = st.session_state.pred_scores[i]
             if scores is not None:
                 score_df = (
@@ -240,7 +388,7 @@ for i, col in enumerate(thumb_cols):
                 )
                 score_df["score"] = score_df["score"].apply(lambda x: f"{x:.4f}")
                 st.caption(f"Classification scores: Photo {i + 1}")
-                st.dataframe(score_df, use_container_width=True, hide_index=True)
+                st.dataframe(score_df, width="stretch", hide_index=True)
         else:
             st.markdown(
                 f'<div style="width:100%;height:88px;border-radius:8px;border:1.5px dashed #2a2a2a;'
@@ -272,10 +420,10 @@ if st.session_state.step == 3:
             st.session_state.cam_key         = 0
             st.session_state.pred_scores     = [None, None, None]
             st.session_state.chosen_concerns = []
+            st.session_state.last_capture_rgb = None
             st.rerun()
 
     if analyze_btn:
-        # ── Classify all 3 images, store scores, union concern IDs ──────────
         all_concern_ids = set()
         with st.spinner("Analyzing skin concerns across all 3 photos..."):
             for i, raw_bytes in enumerate(st.session_state.captures):
@@ -291,13 +439,42 @@ if st.session_state.step == 3:
     if all(s is not None for s in st.session_state.pred_scores):
         chosen = st.session_state.get("chosen_concerns", [])
 
-        st.markdown("### Detected skin concerns")
+        st.markdown("### 🔍 ผลการวิเคราะห์ปัญหาผิวหน้า")
+
         if chosen:
-            st.write([f"{cid} - {CONCERN_ID_TO_NAME.get(cid, str(cid))}" for cid in chosen])
+            all_positive_labels = set()
+            for scores in st.session_state.pred_scores:
+                if scores:
+                    for label, score in scores.items():
+                        threshold = CLASS_THRESHOLDS.get(label, 0.5)
+                        if score >= threshold:
+                            all_positive_labels.add(label)
+
+            if all_positive_labels:
+                descriptions = get_all_descriptions_for_concerns(list(all_positive_labels))
+
+                for label in sorted(all_positive_labels):
+                    desc = descriptions[label]
+                    with st.expander(f"✨ {desc['title']}", expanded=True):
+                        st.markdown(f"**คำอธิบาย:** {desc['description']}")
+                        st.markdown(f"**คำแนะนำ:** {desc['tips']}")
+                        detected_in = []
+                        for i, scores in enumerate(st.session_state.pred_scores):
+                            if scores and label in scores:
+                                threshold = CLASS_THRESHOLDS.get(label, 0.5)
+                                if scores[label] >= threshold:
+                                    detected_in.append(f"ภาพที่ {i+1} ({scores[label]:.2%})")
+                        if detected_in:
+                            st.caption(f"🎯 ตรวจพบใน: {', '.join(detected_in)}")
+
+                st.markdown("---")
+                st.info(f"💡 **สรุป:** ตรวจพบปัญหาผิวทั้งหมด {len(all_positive_labels)} ประเภท จาก {len(chosen)} กลุ่มปัญหาหลัก")
+            else:
+                st.info("ไม่พบปัญหาผิวที่เด่นชัดในภาพของคุณ ผิวของคุณดูดีอยู่แล้ว! 😊")
         else:
             st.warning(
-                "No concerns were detected from any of the 3 photos. "
-                "Please retake your photos and ensure your face is clearly visible."
+                "⚠️ ไม่สามารถตรวจจับปัญหาผิวได้จากภาพทั้ง 3 ภาพ "
+                "กรุณาถ่ายภาพใหม่และตรวจสอบให้แน่ใจว่าใบหน้าของคุณชัดเจน"
             )
             st.stop()
 
@@ -305,7 +482,6 @@ if st.session_state.step == 3:
         st.markdown("---")
         st.markdown("## Recommendations")
 
-        # ── Section 1: Concern-based ──────────────────────────────────────────
         st.markdown("### Products for your skin concerns")
         st.caption("Products matching your analyzed skin concerns")
 
@@ -328,11 +504,10 @@ if st.session_state.step == 3:
         if not recs_concern:
             st.info("No recommendations found. Try adjusting concerns or relaxing filters.")
         else:
-            st.dataframe(_format_recs(recs_concern, item_meta), use_container_width=True)
+            st.dataframe(_format_recs(recs_concern, item_meta), width="stretch")
 
         st.markdown("---")
 
-        # ── Section 2: User-similarity based ─────────────────────────────────
         st.markdown("### Users similar to you also liked")
         st.caption("Based on purchase patterns of similar users")
 
@@ -351,7 +526,7 @@ if st.session_state.step == 3:
                 if not recs_similar:
                     st.info("No similar users found or no recommendations available.")
                 else:
-                    st.dataframe(_format_recs(recs_similar, item_meta), use_container_width=True)
+                    st.dataframe(_format_recs(recs_similar, item_meta), width="stretch")
 
 # ── Active capture step ───────────────────────────────────────────────────────
 else:
@@ -367,97 +542,82 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-    img_file = st.camera_input(
-        f"Step {step + 1}/{len(STEPS)} — {info['label']}",
-        key=f"cam_{step}_{st.session_state.cam_key}",
-    )
+    st.caption("Live webcam guide: follow the oval color and text below. The app auto-captures after the frame stays valid briefly.")
+    run = st.checkbox("Start Webcam", value=True, key=f"run_cam_{step}")
 
-    # # Upload photo (disabled — uncomment to re-enable)
-    # up = st.file_uploader("Or upload a photo", type=["jpg", "jpeg", "png"])
-    # if up is not None:
-    #     img_file = up
+    preview = st.empty()
+    status_box = st.empty()
 
-    if img_file is not None:
-        img_pil = Image.open(img_file).convert("RGB")
-        img_np  = np.array(img_pil)
+    ctrl1, ctrl2 = st.columns(2)
+    with ctrl1:
+        if st.button("Retake current step"):
+            st.session_state.captures[step] = None
+            st.session_state.pred_scores[step] = None
+            st.session_state.last_live_frame = None
+            st.session_state.stable_ok_count = 0
+            st.session_state.last_capture_rgb = None
+            st.rerun()
+    with ctrl2:
+        if st.button("Reset all photos"):
+            st.session_state.step = 0
+            st.session_state.captures = [None, None, None]
+            st.session_state.cam_key = 0
+            st.session_state.pred_scores = [None, None, None]
+            st.session_state.chosen_concerns = []
+            st.session_state.last_live_frame = None
+            st.session_state.stable_ok_count = 0
+            st.session_state.last_capture_rgb = None
+            st.rerun()
 
-        with st.spinner("Analyzing pose..."):
-            result = analyze_face(img_np)
-
-        if result is None:
-            st.markdown('<div class="err-box">No face detected — please center your face in the frame and try again.</div>',
-                        unsafe_allow_html=True)
+    if run:
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            st.error("Cannot access webcam")
         else:
-            yaw        = result["yaw"]
-            coverage   = result["coverage"]
-            target_yaw = info["target_yaw"]
+            try:
+                while run:
+                    ret, frame = cap.read()
+                    if not ret:
+                        status_box.markdown('<div class="err-box">❌ Cannot access webcam frame.</div>', unsafe_allow_html=True)
+                        break
 
-            pose_ok,  pose_msg = check_pose(yaw, step)
-            cov_ok,   cov_msg  = check_coverage(coverage)
-            clamp = lambda v, lo, hi: max(lo, min(hi, v))
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    result = analyze_face(frame_rgb, step)
+                    preview.image(result["annotated_img"], width="stretch")
+                    st.session_state.last_live_frame = result["annotated_img"]
+                    st.session_state.last_capture_rgb = frame_rgb.copy()
 
-            # ── Angle bar ─────────────────────────────────────────────────────
-            pct_cursor = (clamp(yaw, -90, 90) + 90) / 180 * 100
-            pct_target = (clamp(target_yaw, -90, 90) + 90) / 180 * 100
-            bar_col    = "#00ff99" if pose_ok else "#ffcc00"
-            st.markdown(f"""
-            <div class="bar-wrap">
-                <div class="bar-label">
-                    <span>Left</span>
-                    <span style="color:#aaa">Angle: <b style="color:{bar_col}">{yaw:.1f}</b>
-                    &nbsp;|&nbsp; Target: <b style="color:#00ff99">{target_yaw}</b></span>
-                    <span>Right</span>
-                </div>
-                <div class="bar-track">
-                    <div class="bar-target" style="left:{pct_target:.1f}%"></div>
-                    <div class="bar-cursor" style="left:{pct_cursor:.1f}%"></div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+                    if result["face_ok"]:
+                        st.session_state.stable_ok_count += 1
+                        status_box.markdown(
+                            f'<div class="ok-box">✅ {result["status_text"]} ({st.session_state.stable_ok_count}/{_STABLE_FRAMES})</div>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.session_state.stable_ok_count = 0
+                        css = "err-box" if result["status_text"] == "No face detected" else "warn-box"
+                        icon = "❌" if css == "err-box" else "⚠️"
+                        status_box.markdown(
+                            f'<div class="{css}">{icon} {result["status_text"]}</div>',
+                            unsafe_allow_html=True,
+                        )
 
-            # ── Coverage bar ──────────────────────────────────────────────────
-            pct_cov     = clamp(coverage, 0, 100)
-            pct_cov_lo  = 10
-            pct_cov_hi  = 30
-            cov_bar_col = "#00ff99" if cov_ok else "#ffcc00"
-            st.markdown(f"""
-            <div class="bar-wrap">
-                <div class="bar-label">
-                    <span>Far</span>
-                    <span style="color:#aaa">Distance: <b style="color:{cov_bar_col}">{coverage:.0f}%</b>
-                    &nbsp;|&nbsp; Target: <b style="color:#00ff99">10-30%</b></span>
-                    <span>Close</span>
-                </div>
-                <div class="bar-track">
-                    <div style="position:absolute;top:0;left:{pct_cov_lo}%;width:{pct_cov_hi - pct_cov_lo}%;
-                         height:100%;background:rgba(0,255,153,0.15);border-radius:2px;"></div>
-                    <div class="bar-cursor" style="left:{pct_cov:.1f}%"></div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+                    if st.session_state.stable_ok_count >= _STABLE_FRAMES:
+                        capture_rgb = st.session_state.last_capture_rgb if st.session_state.last_capture_rgb is not None else frame_rgb
+                        capture_pil = Image.fromarray(capture_rgb)
+                        buf = io.BytesIO()
+                        capture_pil.save(buf, format="PNG")
+                        st.session_state.captures[step] = buf.getvalue()
+                        st.session_state.step += 1
+                        st.session_state.cam_key += 1
+                        st.session_state.stable_ok_count = 0
+                        break
+            finally:
+                cap.release()
 
-            # ── Feedback messages ─────────────────────────────────────────────
-            if pose_ok and cov_ok:
-                st.markdown('<div class="ok-box">Pose and distance look great — ready to use this photo!</div>',
-                            unsafe_allow_html=True)
-            else:
-                if not pose_ok:
-                    st.markdown(f'<div class="warn-box">{pose_msg}</div>', unsafe_allow_html=True)
-                if not cov_ok:
-                    st.markdown(f'<div class="warn-box">{cov_msg}</div>', unsafe_allow_html=True)
-
-        # ── Accept / retake buttons ───────────────────────────────────────────
-        buf = io.BytesIO()
-        img_pil.save(buf, format="JPEG", quality=92)
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Use this photo"):
-                st.session_state.captures[step] = buf.getvalue()
-                st.session_state.step    += 1
-                st.session_state.cam_key += 1
+            if st.session_state.step != step:
                 st.rerun()
-        with c2:
-            if st.button("Retake"):
-                st.session_state.cam_key += 1
-                st.rerun()
+    else:
+        if st.session_state.last_live_frame is not None:
+            preview.image(st.session_state.last_live_frame, width="stretch")
+        status_box.markdown('<div class="warn-box">⚠️ Webcam paused.</div>', unsafe_allow_html=True)
