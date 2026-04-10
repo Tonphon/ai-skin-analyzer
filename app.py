@@ -43,7 +43,7 @@ _AXES_RATIO     = (0.20, 0.45)
 _MAX_ANGLE_DEG  = 5       # max in-plane eye roll for front step
 _MIN_SIZE_RATIO = 0.98    # face must fill ≥98% of oval axes
 _FRONT_TURN_MAX = 0.10    # near-center for front photo
-_SIDE_TURN_MIN  = 0.12    # minimum normalized turn for side photo
+_SIDE_TURN_MIN  = 0.3    # minimum normalized turn for side photo
 _SIDE_TURN_MAX  = 0.55    # maximum normalized turn for side photo
 _MAX_SIDE_ROLL  = 12      # allow a bit more tilt on side shots
 _STABLE_FRAMES  = 10
@@ -571,6 +571,8 @@ else:
 
     if run:
         cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         if not cap.isOpened():
             st.error("Cannot access webcam")
         else:
